@@ -106,6 +106,7 @@ import com.redhat.ceylon.model.typechecker.model.TypeParameter;
 import com.redhat.ceylon.model.typechecker.model.TypedDeclaration;
 import com.redhat.ceylon.model.typechecker.model.TypedReference;
 import com.redhat.ceylon.model.typechecker.model.UnionType;
+import com.redhat.ceylon.model.typechecker.model.Unit;
 import com.redhat.ceylon.model.typechecker.model.Value;
 
 /**
@@ -5584,7 +5585,7 @@ public class ExpressionTransformer extends AbstractTransformer {
         boolean tmpInStatement = inStatement;
         inStatement = false;
         
-        // FIXME: can this be anything else than a Tree.MemberOrTypeExpression or Tree.ParameterizedExpression?
+        // FIXME: can this be anything else than a Tree.MemberOrTypeExpression or Tree.ParameterizedExpression or Tree.IndexExpression?
         final JCExpression rhs;
         BoxingStrategy boxing;
         if (leftTerm instanceof Tree.MemberOrTypeExpression) {
@@ -5605,8 +5606,13 @@ public class ExpressionTransformer extends AbstractTransformer {
             }
             rhs = transformExpression(rightTerm, boxing, targetType, 
                                       decl.hasUncheckedNullType() ? EXPR_TARGET_ACCEPTS_NULL : 0);
-        } else {
-            // instanceof Tree.ParameterizedExpression
+        } else if (leftTerm instanceof Tree.IndexExpression) {
+            Tree.IndexExpression idx = (Tree.IndexExpression)leftTerm;
+            Unit unit = op.getUnit();
+            Type pt = idx.getPrimary().getTypeModel();
+            boxing = (unit.isJavaPrimitiveArrayType(pt)) ? BoxingStrategy.UNBOXED : BoxingStrategy.BOXED;
+            rhs = transformExpression(rightTerm, boxing, idx.getTypeModel(), 0);
+        } else if (leftTerm instanceof Tree.ParameterizedExpression) {
             boxing = CodegenUtil.getBoxingStrategy(leftTerm);
             Tree.ParameterizedExpression paramExpr = (Tree.ParameterizedExpression)leftTerm;
             FunctionOrValue decl = (FunctionOrValue) ((Tree.MemberOrTypeExpression)paramExpr.getPrimary()).getDeclaration();
@@ -5619,6 +5625,8 @@ public class ExpressionTransformer extends AbstractTransformer {
                     paramExpr.getPrimary().getTypeModel(),
                     decl instanceof Function ? !((Function)decl).isDeferred() : false);
             rhs = callableBuilder.build();
+        } else {
+            return makeErroneous(leftTerm, "compiler bug: left term of type '" + leftTerm.getClass().getSimpleName() + "' is not yet supported");
         }
 
         if (tmpInStatement) {
@@ -5664,7 +5672,8 @@ public class ExpressionTransformer extends AbstractTransformer {
                 }
             }
         } else if(leftTerm instanceof Tree.ParameterizedExpression) {
-            // Nothing to do here
+            expr = null;
+        } else if(leftTerm instanceof Tree.IndexExpression) {
             expr = null;
         } else {
             return makeErroneous(op, "compiler bug: "+op.getNodeType() + " is not yet supported");
@@ -5681,6 +5690,8 @@ public class ExpressionTransformer extends AbstractTransformer {
             decl = (TypedDeclaration) ((Tree.StaticMemberOrTypeExpression)leftTerm).getDeclaration();
             lhs = addInterfaceImplAccessorIfRequired(lhs, (Tree.StaticMemberOrTypeExpression) leftTerm, decl);
             lhs = addThisOrObjectQualifierIfRequired(lhs, (Tree.StaticMemberOrTypeExpression)leftTerm, decl);
+        } else if (leftTerm instanceof Tree.IndexExpression) {
+            return transformIndexAssignment(op, leftTerm, lhs, rhs);
         } else {
             // instanceof Tree.ParameterizedExpression
             decl = (TypedDeclaration) ((Tree.MemberOrTypeExpression)((Tree.ParameterizedExpression)leftTerm).getPrimary()).getDeclaration();
@@ -5751,6 +5762,50 @@ public class ExpressionTransformer extends AbstractTransformer {
         return result;
     }
 
+    private JCExpression transformIndexAssignment(Node op, Tree.Term leftTerm, JCExpression lhs, JCExpression rhs) {
+        JCExpression result = null;
+        Tree.IndexExpression idx = (Tree.IndexExpression)leftTerm;
+        if (idx.getElementOrRange() instanceof Tree.Element) {
+            Unit unit = op.getUnit();
+            Type pt = idx.getPrimary().getTypeModel();
+            Tree.Element elem = (Tree.Element)idx.getElementOrRange();
+            if (pt.getSupertype(unit.getCorrespondenceDeclaration()) != null) {
+                JCExpression iex = transformExpression(elem.getExpression(), BoxingStrategy.BOXED, elem.getExpression().getTypeModel());
+                result = makeIndexAssignMethod(leftTerm, "set", iex, rhs);
+            } else if (pt.getSupertype(unit.getJavaListDeclaration()) != null) {
+                JCExpression iex = transformExpression(elem.getExpression(), BoxingStrategy.UNBOXED, elem.getExpression().getTypeModel());
+                if (!elem.getExpression().getSmall()) {
+                    iex = utilInvocation().toInt(iex);
+                }
+                result = makeIndexAssignMethod(leftTerm, "set", iex, rhs);
+            } else if (pt.getSupertype(unit.getJavaMapDeclaration()) != null) {
+                JCExpression iex = transformExpression(elem.getExpression(), BoxingStrategy.BOXED, elem.getExpression().getTypeModel());
+                result = makeIndexAssignMethod(leftTerm, "put", iex, rhs);
+            } else if (unit.isJavaObjectArrayType(pt) || unit.isJavaPrimitiveArrayType(pt)) {
+                TypedDeclaration decl = (TypedDeclaration) ((Tree.MemberOrTypeExpression)((Tree.IndexExpression)leftTerm).getPrimary()).getDeclaration();
+                JCExpression selector = naming.makeQualifiedName(null, decl, Naming.NA_IDENT);
+                JCExpression iex = transformExpression(elem.getExpression(), BoxingStrategy.UNBOXED, elem.getExpression().getTypeModel());
+                if (!elem.getExpression().getSmall()) {
+                    iex = utilInvocation().toInt(iex);
+                }
+                return at(op).Assign(make().Indexed(selector, iex), rhs);
+            } else {
+                return makeErroneous(leftTerm, "compiler bug: ranged index assignment type '" + pt + "' is not yet supported");
+            }
+            return result;
+        } else {
+            return makeErroneous(leftTerm, "compiler bug: ranged index assignment is not yet supported");
+        }
+    }
+    
+    private JCExpression makeIndexAssignMethod(Tree.Term leftTerm, String method, JCExpression index, JCExpression rhs) {
+        TypedDeclaration decl = (TypedDeclaration) ((Tree.MemberOrTypeExpression)((Tree.IndexExpression)leftTerm).getPrimary()).getDeclaration();
+        JCExpression selector = naming.makeQualifiedName(null, decl, Naming.NA_IDENT);
+        return make().Apply(List.<JCTree.JCExpression>nil(),
+                makeQualIdent(selector, method),
+                List.<JCTree.JCExpression>of(index, rhs));
+    }
+    
     /** Creates an anonymous class that extends Iterable and implements the specified comprehension.
      */
     public JCExpression transformComprehension(Tree.Comprehension comp) {
